@@ -58,152 +58,6 @@ def rand_log_normal(shape, loc=0., scale=1., device='cpu', dtype=torch.float32):
 
 
 
-
-# resizing utils
-# TODO: clean up later
-def _resize_with_antialiasing(input, size, interpolation="bicubic", align_corners=True):
-    h, w = input.shape[-2:]
-    factors = (h / size[0], w / size[1])
-
-    # First, we have to determine sigma
-    # Taken from skimage: https://github.com/scikit-image/scikit-image/blob/v0.19.2/skimage/transform/_warps.py#L171
-    sigmas = (
-        max((factors[0] - 1.0) / 2.0, 0.001),
-        max((factors[1] - 1.0) / 2.0, 0.001),
-    )
-
-    # Now kernel size. Good results are for 3 sigma, but that is kind of slow. Pillow uses 1 sigma
-    # https://github.com/python-pillow/Pillow/blob/master/src/libImaging/Resample.c#L206
-    # But they do it in the 2 passes, which gives better results. Let's try 2 sigmas for now
-    ks = int(max(2.0 * 2 * sigmas[0], 3)), int(max(2.0 * 2 * sigmas[1], 3))
-
-    # Make sure it is odd
-    if (ks[0] % 2) == 0:
-        ks = ks[0] + 1, ks[1]
-
-    if (ks[1] % 2) == 0:
-        ks = ks[0], ks[1] + 1
-
-    input = _gaussian_blur2d(input, ks, sigmas)
-
-    output = torch.nn.functional.interpolate(
-        input, size=size, mode=interpolation, align_corners=align_corners)
-    return output
-
-
-def _compute_padding(kernel_size):
-    """Compute padding tuple."""
-    # 4 or 6 ints:  (padding_left, padding_right,padding_top,padding_bottom)
-    # https://pytorch.org/docs/stable/nn.html#torch.nn.functional.pad
-    if len(kernel_size) < 2:
-        raise AssertionError(kernel_size)
-    computed = [k - 1 for k in kernel_size]
-
-    # for even kernels we need to do asymmetric padding :(
-    out_padding = 2 * len(kernel_size) * [0]
-
-    for i in range(len(kernel_size)):
-        computed_tmp = computed[-(i + 1)]
-
-        pad_front = computed_tmp // 2
-        pad_rear = computed_tmp - pad_front
-
-        out_padding[2 * i + 0] = pad_front
-        out_padding[2 * i + 1] = pad_rear
-
-    return out_padding
-
-
-def _filter2d(input, kernel):
-    # prepare kernel
-    b, c, h, w = input.shape
-    tmp_kernel = kernel[:, None, ...].to(
-        device=input.device, dtype=input.dtype)
-
-    tmp_kernel = tmp_kernel.expand(-1, c, -1, -1)
-
-    height, width = tmp_kernel.shape[-2:]
-
-    padding_shape: list[int] = _compute_padding([height, width])
-    input = torch.nn.functional.pad(input, padding_shape, mode="reflect")
-
-    # kernel and input tensor reshape to align element-wise or batch-wise params
-    tmp_kernel = tmp_kernel.reshape(-1, 1, height, width)
-    input = input.view(-1, tmp_kernel.size(0), input.size(-2), input.size(-1))
-
-    # convolve the tensor with the kernel.
-    output = torch.nn.functional.conv2d(
-        input, tmp_kernel, groups=tmp_kernel.size(0), padding=0, stride=1)
-
-    out = output.view(b, c, h, w)
-    return out
-
-
-def _gaussian(window_size: int, sigma):
-    if isinstance(sigma, float):
-        sigma = torch.tensor([[sigma]])
-
-    batch_size = sigma.shape[0]
-
-    x = (torch.arange(window_size, device=sigma.device,
-         dtype=sigma.dtype) - window_size // 2).expand(batch_size, -1)
-
-    if window_size % 2 == 0:
-        x = x + 0.5
-
-    gauss = torch.exp(-x.pow(2.0) / (2 * sigma.pow(2.0)))
-
-    return gauss / gauss.sum(-1, keepdim=True)
-
-
-def _gaussian_blur2d(input, kernel_size, sigma):
-    if isinstance(sigma, tuple):
-        sigma = torch.tensor([sigma], dtype=input.dtype)
-    else:
-        sigma = sigma.to(dtype=input.dtype)
-
-    ky, kx = int(kernel_size[0]), int(kernel_size[1])
-    bs = sigma.shape[0]
-    kernel_x = _gaussian(kx, sigma[:, 1].view(bs, 1))
-    kernel_y = _gaussian(ky, sigma[:, 0].view(bs, 1))
-    out_x = _filter2d(input, kernel_x[..., None, :])
-    out = _filter2d(out_x, kernel_y[..., None])
-
-    return out
-
-
-def export_to_video(video_frames, output_video_path, fps):
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    h, w, _ = video_frames[0].shape
-    video_writer = cv2.VideoWriter(
-        output_video_path, fourcc, fps=fps, frameSize=(w, h))
-    for i in range(len(video_frames)):
-        img = cv2.cvtColor(video_frames[i], cv2.COLOR_RGB2BGR)
-        video_writer.write(img)
-
-
-def export_to_gif(frames, output_gif_path, fps):
-    """
-    Export a list of frames to a GIF.
-
-    Args:
-    - frames (list): List of frames (as numpy arrays or PIL Image objects).
-    - output_gif_path (str): Path to save the output GIF.
-    - duration_ms (int): Duration of each frame in milliseconds.
-
-    """
-    # Convert numpy arrays to PIL Images if needed
-    pil_frames = [Image.fromarray(frame) if isinstance(
-        frame, np.ndarray) else frame for frame in frames]
-
-    pil_frames[0].save(output_gif_path.replace('.mp4', '.gif'),
-                       format='GIF',
-                       append_images=pil_frames[1:],
-                       save_all=True,
-                       duration=500,
-                       loop=0)
-
-
 def tensor_to_vae_latent(t, vae):
     video_length = t.shape[1]
 
@@ -247,7 +101,7 @@ def parse_args():
     parser.add_argument(
         "--num_frames",
         type=int,
-        default=25,
+        default=16,
     )
     parser.add_argument(
         "--sample_rate",
@@ -584,7 +438,7 @@ def main():
     
     pose_net.requires_grad_(True)
     
-
+    del mimicmotion_model
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -726,26 +580,6 @@ def main():
     global_step = 0
     first_epoch = 0
 
-    # def encode_image(pixel_values):
-    #     # pixel: [-1, 1]
-    #     pixel_values = _resize_with_antialiasing(pixel_values, (224, 224))
-    #     # We unnormalize it after resizing.
-    #     pixel_values = (pixel_values + 1.0) / 2.0
-
-    #     # Normalize the image with for CLIP input
-    #     pixel_values = feature_extractor(
-    #         images=pixel_values,
-    #         do_normalize=True,
-    #         do_center_crop=False,
-    #         do_resize=False,
-    #         do_rescale=False,
-    #         return_tensors="pt",
-    #     ).pixel_values
-
-    #     pixel_values = pixel_values.to(
-    #         device=accelerator.device, dtype=weight_dtype)
-    #     image_embeddings = image_encoder(pixel_values).image_embeds
-    #     return image_embeddings
 
     def _get_add_time_ids(
         fps,
@@ -799,10 +633,9 @@ def main():
     progress_bar = tqdm(range(global_step, args.max_train_steps),
                         disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
-
+    unet.train()
+    pose_net.train()
     for epoch in range(first_epoch, args.num_train_epochs):
-        unet.train()
-        pose_net.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
@@ -811,7 +644,7 @@ def main():
                     progress_bar.update(1)
                 continue
 
-            with accelerator.accumulate(unet, pose_net):
+            with accelerator.accumulate(unet), accelerator.accumulate(pose_net):
                 # first, convert images to latent space.
                 tgt_vid = batch["tgt_vid"].to(weight_dtype).to(
                     accelerator.device, non_blocking=True
@@ -822,21 +655,20 @@ def main():
 
                 latents = tensor_to_vae_latent(tgt_vid, vae)
                 ref_latent = vae.encode(ref_img).latent_dist.sample()
+                ref_latent = ref_latent.repeat(1, 1, 1, 1)
+
                 image_embedding = image_encoder(batch['clip_img']).image_embeds
                 image_embedding = image_embedding.unsqueeze(1)
+                bs_embed, seq_len, _ = image_embedding.shape
+                image_embedding = image_embedding.repeat(1, 1, 1)
+                image_embedding = image_embedding.view(bs_embed * 1, seq_len, -1)
                 pose_latents = pose_net(batch['tgt_lmk'])
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
                 noise_aug_strength = 0.02
-                # cond_sigmas = rand_log_normal(shape=[bsz,], loc=-3.0, scale=0.5).to(latents)
-                # noise_aug_strength = cond_sigmas[0] # TODO: support batch > 1
-                # cond_sigmas = cond_sigmas[:, None, None, None, None]
-                # conditional_pixel_values = \
-                #     torch.randn_like(conditional_pixel_values) * cond_sigmas + conditional_pixel_values
-                # conditional_latents = tensor_to_vae_latent(conditional_pixel_values, vae)[:, 0, :, :, :]
-                # conditional_latents = conditional_latents / vae.config.scaling_factor
+                
 
                 # Sample a random timestep for each image
                 # P_mean=0.7 P_std=1.6
@@ -865,29 +697,6 @@ def main():
                 )
                 added_time_ids = added_time_ids.to(latents.device)
 
-                # Conditioning dropout to support classifier-free guidance during inference. For more details
-                # check out the section 3.2.1 of the original paper https://arxiv.org/abs/2211.09800.
-                # if args.conditioning_dropout_prob is not None:
-                #     random_p = torch.rand(
-                #         bsz, device=latents.device, generator=generator)
-                #     # Sample masks for the edit prompts.
-                #     prompt_mask = random_p < 2 * args.conditioning_dropout_prob
-                #     prompt_mask = prompt_mask.reshape(bsz, 1, 1)
-                #     # Final text conditioning.
-                #     null_conditioning = torch.zeros_like(encoder_hidden_states)
-                #     encoder_hidden_states = torch.where(
-                #         prompt_mask, null_conditioning.unsqueeze(1), encoder_hidden_states.unsqueeze(1))
-                #     # Sample masks for the original images.
-                #     image_mask_dtype = conditional_latents.dtype
-                #     image_mask = 1 - (
-                #         (random_p >= args.conditioning_dropout_prob).to(
-                #             image_mask_dtype)
-                #         * (random_p < 3 * args.conditioning_dropout_prob).to(image_mask_dtype)
-                #     )
-                #     image_mask = image_mask.reshape(bsz, 1, 1, 1)
-                #     # Final image conditioning.
-                #     conditional_latents = image_mask * conditional_latents
-
                 # Concatenate the `conditional_latents` with the `noisy_latents`.
                 ref_latents = ref_latent.unsqueeze(
                     1).repeat(1, noisy_latents.shape[1], 1, 1, 1)
@@ -896,6 +705,7 @@ def main():
 
                 # check https://arxiv.org/abs/2206.00364(the EDM-framework) for more details.
                 target = latents
+               
                 model_pred = unet(
                     input_latents, timesteps, encoder_hidden_states=encoder_hidden_states, 
                     added_time_ids=added_time_ids, pose_latents=pose_latents).sample
@@ -966,73 +776,24 @@ def main():
 
                         save_path = os.path.join(
                             args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
+                        unet_save_dir = os.path.join(save_path, 'unet')
+                        posenet_save_dir = os.path.join(save_path, 'pose_net')
+                        if not os.path.exists(unet_save_dir):
+                            os.makedirs(unet_save_dir)
+                        if not os.path.exists(posenet_save_dir):
+                            os.makedirs(posenet_save_dir)
+                        #unet_dict = unet.state_dict()
+                        pose_dict = pose_net.state_dict()
+                        unet.save_pretrained(unet_save_dir)
+                        torch.save(pose_dict, os.path.join(posenet_save_dir, 'pose_net.pth'))
                         logger.info(f"Saved state to {save_path}")
-                    # sample images!
-                    if (
-                        (global_step % args.validation_steps == 0)
-                        or (global_step == 1)
-                    ):
-                        logger.info(
-                            f"Running validation... \n Generating {args.num_validation_images} videos."
-                        )
-                        # create pipeline
-                        if args.use_ema:
-                            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                            ema_unet.store(unet.parameters())
-                            ema_unet.copy_to(unet.parameters())
-                        # The models need unwrapping because for compatibility in distributed training mode.
-                        pipeline = MimicMotionPipeline.from_pretrained(
-                            args.pretrained_model_name_or_path,
-                            unet=accelerator.unwrap_model(unet),
-                            image_encoder=accelerator.unwrap_model(
-                                image_encoder),
-                            vae=accelerator.unwrap_model(vae),
-                            revision=args.revision,
-                            torch_dtype=weight_dtype,
-                        )
-                        pipeline = pipeline.to(accelerator.device)
-                        pipeline.set_progress_bar_config(disable=True)
-
-                        # run inference
-                        val_save_dir = os.path.join(
-                            args.output_dir, "validation_images")
-
-                        if not os.path.exists(val_save_dir):
-                            os.makedirs(val_save_dir)
-
-                        with torch.autocast(
-                            str(accelerator.device).replace(":0", ""), enabled=accelerator.mixed_precision == "fp16"
-                        ):
-                            for val_img_idx in range(args.num_validation_images):
-                                num_frames = args.num_frames
-                                video_frames = pipeline(
-                                    load_image('demo.jpg').resize((args.width, args.height)),
-                                    height=args.height,
-                                    width=args.width,
-                                    num_frames=num_frames,
-                                    decode_chunk_size=8,
-                                    motion_bucket_id=127,
-                                    fps=7,
-                                    noise_aug_strength=0.02,
-                                    # generator=generator,
-                                ).frames[0]
-
-                                out_file = os.path.join(
-                                    val_save_dir,
-                                    f"step_{global_step}_val_img_{val_img_idx}.mp4",
-                                )
-
-                                for i in range(num_frames):
-                                    img = video_frames[i]
-                                    video_frames[i] = np.array(img)
-                                export_to_gif(video_frames, out_file, 8)
+                    
 
                         if args.use_ema:
                             # Switch back to the original UNet parameters.
                             ema_unet.restore(unet.parameters())
 
-                        del pipeline
+                        # del pipeline
                         torch.cuda.empty_cache()
 
             logs = {"step_loss": loss.detach().item(
@@ -1042,24 +803,7 @@ def main():
             if global_step >= args.max_train_steps:
                 break
 
-    # Create the pipeline using the trained modules and save it.
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        unet = accelerator.unwrap_model(unet)
-        pose_net =  accelerator.unwrap_model(pose_net)
-        if args.use_ema:
-            ema_unet.copy_to(unet.parameters())
-
-        pipeline = MimicMotionPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
-            image_encoder=accelerator.unwrap_model(image_encoder),
-            vae=accelerator.unwrap_model(vae),
-            unet=unet,
-            revision=args.revision,
-        )
-        pipeline.save_pretrained(args.output_dir)
-
-        
+    accelerator.wait_for_everyone() 
     accelerator.end_training()
 
 

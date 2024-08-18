@@ -66,6 +66,7 @@ video_data/XXXvideo
 |-- imgs
 |-- faces
 |-- lmks
+|-- pose_mask
 ```
 
 ### Model train
@@ -81,6 +82,7 @@ CUDA_VISIBLE_DEVICES=0
   --pretrained_model_name_or_path="stabilityai/stable-video-diffusion-img2vid-xt" \
   --per_gpu_batch_size=1 \
   --max_train_steps=50000 \
+  --grad
   --width=576 \
   --height=1024 \
   --use_8bit_adam \
