@@ -13,6 +13,7 @@ import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 
+import itertools
 import accelerate
 import numpy as np
 import PIL
@@ -32,19 +33,22 @@ from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 from einops import rearrange
 
 import diffusers
-from mimicmotion.pipelines.pipeline_mimicmotion import MimicMotionPipeline
-from mimicmotion.utils.loader import MimicMotionModel
+
 from diffusers.models.lora import LoRALinearLayer
-# from diffusers import AutoencoderKLTemporalDecoder, EulerDiscreteScheduler, UNetSpatioTemporalConditionModel
+from mimicmotion.modules.unet import UNetSpatioTemporalConditionModel
+from mimicmotion.modules.pose_net import PoseNet
+from diffusers import AutoencoderKLTemporalDecoder
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate, is_wandb_available, load_image
 from diffusers.utils.import_utils import is_xformers_available
+from torchvision.transforms.functional import to_pil_image
 
-from dataset import TikTokDataset
+from dataset_face7 import TikTokDataset
 from mimicmotion.modules.pose_net import PoseNet
-
+from diffusers.utils.torch_utils import randn_tensor
+from diffusers import EulerDiscreteScheduler
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.24.0.dev0")
 
@@ -56,30 +60,166 @@ def rand_log_normal(shape, loc=0., scale=1., device='cpu', dtype=torch.float32):
     u = torch.rand(shape, dtype=dtype, device=device) * (1 - 2e-7) + 1e-7
     return torch.distributions.Normal(loc, scale).icdf(u).exp()
 
+def stratified_uniform(shape, group=0, groups=1, dtype=None, device=None):
+    """Draws stratified samples from a uniform distribution."""
+    if groups <= 0:
+        raise ValueError(f"groups must be positive, got {groups}")
+    if group < 0 or group >= groups:
+        raise ValueError(f"group must be in [0, {groups})")
+    n = shape[-1] * groups
+    offsets = torch.arange(group, n, groups, dtype=dtype, device=device)
+    u = torch.rand(shape, dtype=dtype, device=device)
+    return (offsets + u) / n
 
+def rand_cosine_interpolated(shape, image_d, noise_d_low, noise_d_high, sigma_data=1., min_value=1e-3, max_value=1e3, device='cpu', dtype=torch.float32):
+    """Draws samples from an interpolated cosine timestep distribution (from simple diffusion)."""
 
-def tensor_to_vae_latent(t, vae):
+    def logsnr_schedule_cosine(t, logsnr_min, logsnr_max):
+        t_min = math.atan(math.exp(-0.5 * logsnr_max))
+        t_max = math.atan(math.exp(-0.5 * logsnr_min))
+        return -2 * torch.log(torch.tan(t_min + t * (t_max - t_min)))
+
+    def logsnr_schedule_cosine_shifted(t, image_d, noise_d, logsnr_min, logsnr_max):
+        shift = 2 * math.log(noise_d / image_d)
+        return logsnr_schedule_cosine(t, logsnr_min - shift, logsnr_max - shift) + shift
+
+    def logsnr_schedule_cosine_interpolated(t, image_d, noise_d_low, noise_d_high, logsnr_min, logsnr_max):
+        logsnr_low = logsnr_schedule_cosine_shifted(
+            t, image_d, noise_d_low, logsnr_min, logsnr_max)
+        logsnr_high = logsnr_schedule_cosine_shifted(
+            t, image_d, noise_d_high, logsnr_min, logsnr_max)
+        return torch.lerp(logsnr_low, logsnr_high, t)
+
+    logsnr_min = -2 * math.log(min_value / sigma_data)
+    logsnr_max = -2 * math.log(max_value / sigma_data)
+    u = stratified_uniform(
+        shape, group=0, groups=1, dtype=dtype, device=device
+    )
+    logsnr = logsnr_schedule_cosine_interpolated(
+        u, image_d, noise_d_low, noise_d_high, logsnr_min, logsnr_max)
+    return torch.exp(-logsnr / 2) * sigma_data
+
+def tensor_to_vae_latent(t, vae, scale=True):
     video_length = t.shape[1]
-
-    t = rearrange(t, "b f c h w -> (b f) c h w")
-    latents = vae.encode(t).latent_dist.sample()
-    latents = rearrange(latents, "(b f) c h w -> b f c h w", f=video_length)
-    latents = latents * vae.config.scaling_factor
-
+    if len(t.shape) == 5:
+        t = rearrange(t, "b f c h w -> (b f) c h w")
+        latents = vae.encode(t).latent_dist.sample()
+        latents = rearrange(latents, "(b f) c h w -> b f c h w", f=video_length)
+    elif len(t.shape) == 4:
+        latents = vae.encode(t).latent_dist.sample()
+    if scale:
+        latents = latents * vae.config.scaling_factor
     return latents
 
-def collate_fn(data):
-    tgt_vid = torch.stack([example["tgt_vid"] for example in data])
-    tgt_lmk = torch.stack([example["tgt_lmk"] for example in data])
-    clip_img = torch.stack([torch.Tensor(example["clip_img"]) for example in data])
-    ref_img = torch.stack([example["ref_img"] for example in data])
+def _resize_with_antialiasing(input, size, interpolation="bicubic", align_corners=True):
+    h, w = input.shape[-2:]
+    factors = (h / size[0], w / size[1])
 
-    return {
-        "tgt_vid": tgt_vid,
-        "tgt_lmk": tgt_lmk,
-        "clip_img": clip_img,
-        "ref_img": ref_img,
-    }  
+    # First, we have to determine sigma
+    # Taken from skimage: https://github.com/scikit-image/scikit-image/blob/v0.19.2/skimage/transform/_warps.py#L171
+    sigmas = (
+        max((factors[0] - 1.0) / 2.0, 0.001),
+        max((factors[1] - 1.0) / 2.0, 0.001),
+    )
+
+    # Now kernel size. Good results are for 3 sigma, but that is kind of slow. Pillow uses 1 sigma
+    # https://github.com/python-pillow/Pillow/blob/master/src/libImaging/Resample.c#L206
+    # But they do it in the 2 passes, which gives better results. Let's try 2 sigmas for now
+    ks = int(max(2.0 * 2 * sigmas[0], 3)), int(max(2.0 * 2 * sigmas[1], 3))
+
+    # Make sure it is odd
+    if (ks[0] % 2) == 0:
+        ks = ks[0] + 1, ks[1]
+
+    if (ks[1] % 2) == 0:
+        ks = ks[0], ks[1] + 1
+
+    input = _gaussian_blur2d(input, ks, sigmas)
+
+    output = torch.nn.functional.interpolate(
+        input, size=size, mode=interpolation, align_corners=align_corners)
+    return output
+
+
+def _compute_padding(kernel_size):
+    """Compute padding tuple."""
+    # 4 or 6 ints:  (padding_left, padding_right,padding_top,padding_bottom)
+    # https://pytorch.org/docs/stable/nn.html#torch.nn.functional.pad
+    if len(kernel_size) < 2:
+        raise AssertionError(kernel_size)
+    computed = [k - 1 for k in kernel_size]
+
+    # for even kernels we need to do asymmetric padding :(
+    out_padding = 2 * len(kernel_size) * [0]
+
+    for i in range(len(kernel_size)):
+        computed_tmp = computed[-(i + 1)]
+
+        pad_front = computed_tmp // 2
+        pad_rear = computed_tmp - pad_front
+
+        out_padding[2 * i + 0] = pad_front
+        out_padding[2 * i + 1] = pad_rear
+
+    return out_padding
+
+
+def _filter2d(input, kernel):
+    # prepare kernel
+    b, c, h, w = input.shape
+    tmp_kernel = kernel[:, None, ...].to(
+        device=input.device, dtype=input.dtype)
+
+    tmp_kernel = tmp_kernel.expand(-1, c, -1, -1)
+
+    height, width = tmp_kernel.shape[-2:]
+
+    padding_shape: list[int] = _compute_padding([height, width])
+    input = torch.nn.functional.pad(input, padding_shape, mode="reflect")
+
+    # kernel and input tensor reshape to align element-wise or batch-wise params
+    tmp_kernel = tmp_kernel.reshape(-1, 1, height, width)
+    input = input.view(-1, tmp_kernel.size(0), input.size(-2), input.size(-1))
+
+    # convolve the tensor with the kernel.
+    output = torch.nn.functional.conv2d(
+        input, tmp_kernel, groups=tmp_kernel.size(0), padding=0, stride=1)
+
+    out = output.view(b, c, h, w)
+    return out
+
+
+def _gaussian(window_size: int, sigma):
+    if isinstance(sigma, float):
+        sigma = torch.tensor([[sigma]])
+
+    batch_size = sigma.shape[0]
+
+    x = (torch.arange(window_size, device=sigma.device,
+         dtype=sigma.dtype) - window_size // 2).expand(batch_size, -1)
+
+    if window_size % 2 == 0:
+        x = x + 0.5
+    x = x.float()
+    gauss = torch.exp(-x.pow(2.0) / (2 * sigma.pow(2.0)))
+
+    return gauss / gauss.sum(-1, keepdim=True)
+
+
+def _gaussian_blur2d(input, kernel_size, sigma):
+    if isinstance(sigma, tuple):
+        sigma = torch.tensor([sigma], dtype=input.dtype)
+    else:
+        sigma = sigma.to(dtype=input.dtype)
+
+    ky, kx = int(kernel_size[0]), int(kernel_size[1])
+    bs = sigma.shape[0]
+    kernel_x = _gaussian(kx, sigma[:, 1].view(bs, 1))
+    kernel_y = _gaussian(ky, sigma[:, 0].view(bs, 1))
+    out_x = _filter2d(input, kernel_x[..., None, :])
+    out = _filter2d(out_x, kernel_y[..., None])
+
+    return out
 
 
 def parse_args():
@@ -106,7 +246,7 @@ def parse_args():
     parser.add_argument(
         "--sample_rate",
         type=int,
-        default=4,
+        default=3,
     )
     parser.add_argument(
         "--width",
@@ -137,7 +277,7 @@ def parse_args():
     parser.add_argument(
         "--validation_steps",
         type=int,
-        default=500,
+        default=400,
         help=(
             "Run fine-tuning validation every X epochs. The validation process consists of running the text/image prompt"
             " multiple times: `args.num_validation_images`."
@@ -146,7 +286,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./outputs",
+        default="./outputs_ubc_pose10",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
@@ -157,6 +297,12 @@ def parse_args():
         type=int,
         default=1,
         help="Batch size (per device) for the training dataloader.",
+    )
+    parser.add_argument(
+        "--prediction_type",
+        type=str,
+        default='v_prediction',
+        help="The prediction_type that shall be used for training. Choose between 'epsilon' or 'v_prediction' or leave `None`. If left to `None` the default prediction type of the scheduler: `noise_scheduler.config.prediction_type` is chosen.",
     )
     parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
@@ -176,6 +322,7 @@ def parse_args():
         action="store_true",
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
+    parser.add_argument("--noise_offset", type=float, default=None, help="noise offset")
     parser.add_argument(
         "--learning_rate",
         type=float,
@@ -265,7 +412,7 @@ def parse_args():
         help="Epsilon value for the Adam optimizer",
     )
     parser.add_argument(
-        "--max_grad_norm", default=1.0, type=float, help="Max gradient norm."
+        "--max_grad_norm", default=0.5, type=float, help="Max gradient norm."
     )
     parser.add_argument(
         "--push_to_hub",
@@ -331,7 +478,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
-        default=2,
+        default=40,
         help=("Max number of checkpoints to store."),
     )
     parser.add_argument(
@@ -424,21 +571,28 @@ def main():
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
-    # Load mimicmotion model
-    mimicmotion_model = MimicMotionModel(args.pretrained_model_name_or_path)
+    # Load pretrain model
 
-    vae = mimicmotion_model.vae
-    image_encoder = mimicmotion_model.image_encoder
-    unet = mimicmotion_model.unet
-    pose_net = mimicmotion_model.pose_net
+    unet = UNetSpatioTemporalConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="unet")
+    vae = AutoencoderKLTemporalDecoder.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="vae", torch_dtype=torch.float16, variant="fp16")
+    image_encoder = CLIPVisionModelWithProjection.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="image_encoder", torch_dtype=torch.float16, variant="fp16")
+    noise_scheduler = EulerDiscreteScheduler.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="scheduler")
+    feature_extractor = CLIPImageProcessor.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="feature_extractor")
+    # pose_net
+    pose_net = PoseNet(noise_latent_channels=unet.config.block_out_channels[0])
+    pose_net = pose_net.from_pretrained('pose_net.pth')
+
 
     vae.requires_grad_(False)
     image_encoder.requires_grad_(False)
     unet.requires_grad_(True)
-    
     pose_net.requires_grad_(True)
-    
-    del mimicmotion_model
+ 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -450,7 +604,7 @@ def main():
     # Move image_encoder and vae to gpu and cast to weight_dtype
     image_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
-
+    
 
     # Create EMA for the unet.
     if args.use_ema:
@@ -474,7 +628,6 @@ def main():
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
-
     # Enable TF32 for faster training on Ampere GPUs,
     # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
     if args.allow_tf32:
@@ -498,26 +651,27 @@ def main():
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
-
+  
+    params_to_optimize = itertools.chain(unet.parameters(), pose_net.parameters())
+    
     optimizer = optimizer_cls(
-        [{"params":unet.parameters()},{"params":pose_net.parameters()}],
+        params_to_optimize,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-
     
 
+    
     # DataLoaders creation:
     args.global_batch_size = args.per_gpu_batch_size * accelerator.num_processes
 
     train_dataset = TikTokDataset(args.video_folder, width=args.width, height=args.height, sample_frames=args.num_frames, sample_rate=args.sample_rate)
-    # sampler = RandomSampler(train_dataset)
+    sampler = RandomSampler(train_dataset)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        collate_fn=collate_fn,
-        shuffle=True,
+        sampler=sampler,
         batch_size=args.per_gpu_batch_size,
         num_workers=args.num_workers,
     )
@@ -579,7 +733,32 @@ def main():
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    image_processor = VaeImageProcessor(vae_scale_factor=vae_scale_factor, do_convert_rgb=True)
+    
+    def encode_image(pixel_values):
+        image = image_processor.pil_to_numpy(pixel_values)
+        pixel_values = image_processor.numpy_to_pt(image)
+        pixel_values = pixel_values * 2.0 - 1.0
+        pixel_values = _resize_with_antialiasing(pixel_values, (224, 224))
+        # We unnormalize it after resizing.
+        pixel_values = (pixel_values + 1.0) / 2.0
 
+        # Normalize the image with for CLIP input
+        pixel_values = feature_extractor(
+            images=pixel_values,
+            do_normalize=True,
+            do_center_crop=False,
+            do_resize=False,
+            do_rescale=False,
+            return_tensors="pt",
+        ).pixel_values
+
+        pixel_values = pixel_values.to(
+            device=accelerator.device, dtype=weight_dtype)
+        image_embeddings = image_encoder(pixel_values).image_embeds
+        image_embeddings = image_embeddings.unsqueeze(1)
+        return image_embeddings
 
     def _get_add_time_ids(
         fps,
@@ -587,8 +766,9 @@ def main():
         noise_aug_strength,
         dtype,
         batch_size,
+        unet
     ):
-        add_time_ids = [fps, motion_bucket_id, noise_aug_strength]
+        add_time_ids = [fps, noise_aug_strength, motion_bucket_id, ]
 
         passed_add_embed_dim = unet.config.addition_time_embed_dim * \
             len(add_time_ids)
@@ -621,7 +801,9 @@ def main():
             args.resume_from_checkpoint = None
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            path = os.path.join(args.output_dir, path)
+            unet = unet.from_pretrained(os.path.join(path, "unet"))
+            pose_net = pose_net.from_pretrained(os.path.join(path, 'pose_net/pose_net.pth'))
             global_step = int(path.split("-")[1])
 
             resume_global_step = global_step * args.gradient_accumulation_steps
@@ -633,9 +815,10 @@ def main():
     progress_bar = tqdm(range(global_step, args.max_train_steps),
                         disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
-    unet.train()
-    pose_net.train()
+    num_inference_steps = 25
     for epoch in range(first_epoch, args.num_train_epochs):
+        unet.train()
+        pose_net.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
@@ -644,86 +827,84 @@ def main():
                     progress_bar.update(1)
                 continue
 
-            with accelerator.accumulate(unet), accelerator.accumulate(pose_net):
+            with accelerator.accumulate(unet, pose_net):
                 # first, convert images to latent space.
-                tgt_vid = batch["tgt_vid"].to(weight_dtype).to(
-                    accelerator.device, non_blocking=True
-                )
-                ref_img = batch["ref_img"].to(weight_dtype).to(
+                pixel_values = batch["pixel_values"].to(weight_dtype).to(
                     accelerator.device, non_blocking=True
                 )
 
-                latents = tensor_to_vae_latent(tgt_vid, vae)
-                ref_latent = vae.encode(ref_img).latent_dist.sample()
-                ref_latent = ref_latent.repeat(1, 1, 1, 1)
-
-                image_embedding = image_encoder(batch['clip_img']).image_embeds
-                image_embedding = image_embedding.unsqueeze(1)
-                bs_embed, seq_len, _ = image_embedding.shape
-                image_embedding = image_embedding.repeat(1, 1, 1)
-                image_embedding = image_embedding.view(bs_embed * 1, seq_len, -1)
-                pose_latents = pose_net(batch['tgt_lmk'])
-
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-                noise_aug_strength = 0.02
-                
-
-                # Sample a random timestep for each image
-                # P_mean=0.7 P_std=1.6
-                sigmas = rand_log_normal(shape=[bsz,], loc=0.7, scale=1.6).to(latents.device)
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                sigmas = sigmas[:, None, None, None, None]
-                noisy_latents = latents + noise * sigmas
-                timesteps = torch.Tensor(
-                    [0.25 * sigma.log() for sigma in sigmas]).to(accelerator.device)
-
-                latent_model_input = noisy_latents / ((sigmas**2 + 1) ** 0.5)
-
-                # Get the text embedding for conditioning.
-                encoder_hidden_states = image_embedding
-
-                # Here I input a fixed numerical value for 'motion_bucket_id', which is not reasonable.
-                # However, I am unable to fully align with the calculation method of the motion score,
-                # so I adopted this approach. The same applies to the 'fps' (frames per second).
+                conditional_pixel_values = batch["reference_image"].to(weight_dtype).to(
+                        accelerator.device, non_blocking=True
+                    )
+                with torch.no_grad():
+                    latents = tensor_to_vae_latent(pixel_values.to(weight_dtype).to(accelerator.device), vae)
+                    conditional_pil_img = [to_pil_image(img.to(torch.uint8)) for img in (conditional_pixel_values * 255.0) ][0]
+                    encoder_hidden_states = encode_image(conditional_pil_img).to(dtype=weight_dtype)
+                    bsz = latents.shape[0]
+                    
+                    noise_aug_strength = 0.02
+                    conditional_pixel_value = image_processor.preprocess(conditional_pil_img, height=args.height, width=args.width).to(accelerator.device)
+                    noise = torch.randn_like(latents)
+                    conditional_latents = vae.encode(conditional_pixel_value.to(weight_dtype)).latent_dist.mode() 
+                    conditional_pixel_values = noise[:, 0, :, :, :] * noise_aug_strength + conditional_latents
+                    
+                pose_latents = pose_net(batch['pose_pixel_values'].to(weight_dtype).to(
+                    accelerator.device, non_blocking=True
+                ))
+        
                 added_time_ids = _get_add_time_ids(
-                    args.fps, # fixed
-                    args.motion_bucket_id, # motion_bucket_id = 127, fixed
-                    noise_aug_strength, # noise_aug_strength == cond_sigmas
+                    args.fps-1,
+                    args.motion_bucket_id,
+                    noise_aug_strength,  # noise_aug_strength == 0.0
                     encoder_hidden_states.dtype,
                     bsz,
+                    unet
                 )
                 added_time_ids = added_time_ids.to(latents.device)
 
+                if args.conditioning_dropout_prob is not None:
+                    random_p = torch.rand(
+                        bsz, device=latents.device, generator=generator)
+                    # Sample masks for the edit prompts.
+                    prompt_mask = random_p < 2 * args.conditioning_dropout_prob
+                    prompt_mask = prompt_mask.reshape(bsz, 1, 1)
+                    # Final text conditioning.
+                    null_conditioning = torch.zeros_like(encoder_hidden_states)
+                    encoder_hidden_states = torch.where(
+                        prompt_mask, null_conditioning, encoder_hidden_states)
+
+                    # Sample masks for the original images.
+                    image_mask_dtype = conditional_latents.dtype
+                    image_mask = 1 - (
+                        (random_p >= args.conditioning_dropout_prob).to(
+                            image_mask_dtype)
+                        * (random_p < 3 * args.conditioning_dropout_prob).to(image_mask_dtype)
+                    )
+                    image_mask = image_mask.reshape(bsz, 1, 1, 1)
+                    # Final image conditioning.
+                    conditional_latents = image_mask * conditional_latents
+
                 # Concatenate the `conditional_latents` with the `noisy_latents`.
-                ref_latents = ref_latent.unsqueeze(
-                    1).repeat(1, noisy_latents.shape[1], 1, 1, 1)
-                input_latents = torch.cat(
-                    [latent_model_input, ref_latents], dim=2)
-
-                # check https://arxiv.org/abs/2206.00364(the EDM-framework) for more details.
-                target = latents
-               
-                model_pred = unet(
-                    input_latents, timesteps, encoder_hidden_states=encoder_hidden_states, 
-                    added_time_ids=added_time_ids, pose_latents=pose_latents).sample
-
-                # Denoise the latents
-                c_out = -sigmas / ((sigmas**2 + 1)**0.5)
-                c_skip = 1 / (sigmas**2 + 1)
-                denoised_latents = model_pred * c_out + c_skip * noisy_latents
-                weighing = (1 + sigmas ** 2) * (sigmas**-2.0)
-
-                # MSE loss
-                loss = torch.mean(
-                    (weighing.float() * (denoised_latents.float() -
-                     target.float()) ** 2).reshape(target.shape[0], -1),
-                    dim=1,
-                )
-                loss = loss.mean()
-
+                conditional_latents = conditional_latents.unsqueeze(
+                    1).repeat(1, latents.shape[1], 1, 1, 1)
+                P_std = 0.7
+                P_mean = 1.6
+                rnd_normal = torch.randn([bsz, 1, 1, 1, 1], device=latents.device)
+                sigma = (rnd_normal * P_std + P_mean).exp()
+                c_skip = 1 / (sigma**2 + 1)
+                c_out =  -sigma / (sigma**2 + 1) ** 0.5
+                c_in = 1 / (sigma**2 + 1) ** 0.5
+                c_noise = sigma.log() / 4           
+                loss_weight = (sigma ** 2 + 1) / sigma ** 2
+                
+                noisy_latents = latents + torch.randn_like(latents) * sigma
+                input_latents = c_in * noisy_latents
+                input_latents = torch.cat([input_latents, conditional_latents], dim=2) 
+                
+                model_pred = unet(input_latents, c_noise.reshape([bsz]), encoder_hidden_states=encoder_hidden_states, added_time_ids=added_time_ids,pose_latents=pose_latents).sample
+                predict_x0 = c_out * model_pred + c_skip * noisy_latents 
+                loss = ((predict_x0 - latents)**2 * loss_weight).mean()
+           
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(
                     loss.repeat(args.per_gpu_batch_size)).mean()
@@ -731,8 +912,13 @@ def main():
 
                 # Backpropagate
                 accelerator.backward(loss)
-                # if accelerator.sync_gradients:
-                #     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                if accelerator.sync_gradients:
+                    params_to_clip = (itertools.chain(unet.parameters(), pose_net.parameters()))
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                for p in unet.parameters():
+                    if p.grad is not None:
+                        p.grad.nan_to_num_()
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -782,19 +968,12 @@ def main():
                             os.makedirs(unet_save_dir)
                         if not os.path.exists(posenet_save_dir):
                             os.makedirs(posenet_save_dir)
-                        #unet_dict = unet.state_dict()
+                        
                         pose_dict = pose_net.state_dict()
+                        unet.save_pretrained(unet_save_dir, variant="fp16")
                         unet.save_pretrained(unet_save_dir)
                         torch.save(pose_dict, os.path.join(posenet_save_dir, 'pose_net.pth'))
                         logger.info(f"Saved state to {save_path}")
-                    
-
-                        if args.use_ema:
-                            # Switch back to the original UNet parameters.
-                            ema_unet.restore(unet.parameters())
-
-                        # del pipeline
-                        torch.cuda.empty_cache()
 
             logs = {"step_loss": loss.detach().item(
             ), "lr": lr_scheduler.get_last_lr()[0]}

@@ -14,17 +14,21 @@ This is the unofficial train code of MimicMotion: High-Quality Human Motion Vide
   <i>An overview of the framework of MimicMotion.</i>
 </p>
 
-In recent years, generative artificial intelligence has achieved significant advancements in the field of image generation, spawning a variety of applications. However, video generation still faces considerable challenges in various aspects such as controllability, video length, and richness of details, which hinder the application and popularization of this technology. In this work, we propose a controllable video generation framework, dubbed *MimicMotion*, which can generate high-quality videos of arbitrary length with any motion guidance. Comparing with previous methods, our approach has several highlights. Firstly, with confidence-aware pose guidance, temporal smoothness can be achieved so model robustness can be enhanced with large-scale training data. Secondly, regional loss amplification based on pose confidence significantly eases the distortion of image significantly. Lastly, for generating long smooth videos, a progressive latent fusion strategy is proposed. By this means, videos of arbitrary length can be generated with acceptable resource consumption. With extensive experiments and user studies, MimicMotion demonstrates significant improvements over previous approaches in multiple aspects.
 
 
 
-## Quickstart
 
-For the initial released version of the model checkpoint, it supports generating videos with a maximum of 72 frames at a 576x1024 resolution. If you encounter insufficient memory issues, you can appropriately reduce the number of frames.
+## Training Guidance
+
+1. In the experiments, the posenet is so hard to control, So I do a lot of  experiments for it. I think the posenet is not good for control the pose, But I train the posenet with unet2d, the results shows that posenet can control the pose for sd-2.1, You can follow my other project Pose2Image.
+2. The diffusers is unstabitily, I do it with different versions, the result is different
+3. It is need clear data and so many datasets, This is a data hungry task
+4. It is bad for train many epochs, mybe my dataset is so poor
+   
 
 ### Environment setup
 
-Recommend python 3+ with torch 2.x are validated with an Nvidia V100 GPU. Follow the command below to install all the dependencies of python:
+Recommend python 3+ with torch 2.x are validated with an Nvidia A800 GPU. Follow the command below to install all the dependencies of python:
 
 ```
 conda env create -f environment.yaml
@@ -57,18 +61,22 @@ models/
 ├── DWPose
 │   ├── dw-ll_ucoco_384.onnx
 │   └── yolox_l.onnx
-└── MimicMotion_1-1.pth
 ```
 
-### train data structure
+### dataset structure
 ```
-video_data/XXXvideo
-|-- imgs
-|-- faces
-|-- lmks
-|-- pose_mask
+ubc_data
+|-- videos
+|-- pose_score
+|-- ref
+|-- dwpose
 ```
-
+You can run the script to get the pose, pose_score, reference face pic 
+```
+python get_video_pose.py ubc_data/videos  dwpose
+python get_video_pose_score.py ubc_data/videos  pose_score
+python get_video_reference.py ubc_data/videos  ref
+```
 ### Model train
 
 ```
@@ -78,15 +86,13 @@ or
 ```
 CUDA_VISIBLE_DEVICES=0  
   accelerate launch --num_processes 1 --mixed_precision "fp16" train.py \
-  --video_folder='video_data' \
-  --pretrained_model_name_or_path="stabilityai/stable-video-diffusion-img2vid-xt" \
+  --video_folder='ubc_data' \
+  --pretrained_model_name_or_path="stabilityai/stable-video-diffusion-img2vid-xt-1-1" \
   --per_gpu_batch_size=1 \
   --max_train_steps=50000 \
-  --grad
   --width=576 \
-  --height=1024 \
-  --use_8bit_adam \
-  --checkpointing_steps=100 \
+  --height=768 \
+  --checkpointing_steps=200 \
   --learning_rate=1e-05 \
   --lr_warmup_steps=0 \
   --seed=123 \
