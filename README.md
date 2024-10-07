@@ -20,11 +20,11 @@ This is the unofficial train code of MimicMotion: High-Quality Human Motion Vide
 
 ## Training Guidance
 
-1. In the experiments, the posenet is so hard to control, So I do a lot of  experiments for it. I think the posenet is not good for control the pose, But I train the posenet with unet2d, the results shows that posenet can control the pose for sd-2.1, You can follow my other project Pose2Image.
+1. In the experiments, the posenet is so hard to control, So I do a lot of  experiments for it. I think the posenet is not good for control the pose, But I train the posenet with unet2d, the results shows that posenet can control the pose for sd-2.1, You can follow my other project Pose2Image.(https://github.com/luxiaolili/Pose2Image)
 2. The diffusers is unstabitily, I do it with different versions, the result is different
 3. It is need clear data and so many datasets, This is a data hungry task
 4. It is bad for train many epochs, mybe my dataset is so poor
-5. Maybe you should train the posenet on image and finetune the unet and posenet for SVD
+5. Maybe you should train the posenet on image and finetune the unet and posenet for SVD. (https://github.com/luxiaolili/Pose2Image)
    
 
 ### Environment setup
