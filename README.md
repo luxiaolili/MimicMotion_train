@@ -24,6 +24,7 @@ This is the unofficial train code of MimicMotion: High-Quality Human Motion Vide
 2. The diffusers is unstabitily, I do it with different versions, the result is different
 3. It is need clear data and so many datasets, This is a data hungry task
 4. It is bad for train many epochs, mybe my dataset is so poor
+5. Maybe you should train the posenet on image and finetune the unet and posenet for SVD
    
 
 ### Environment setup
