@@ -45,7 +45,7 @@ from diffusers.utils import check_min_version, deprecate, is_wandb_available, lo
 from diffusers.utils.import_utils import is_xformers_available
 from torchvision.transforms.functional import to_pil_image
 
-from dataset_face7 import TikTokDataset
+from dataset import TikTokDataset
 from mimicmotion.modules.pose_net import PoseNet
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers import EulerDiscreteScheduler
